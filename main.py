@@ -288,7 +288,7 @@ def summarize_observation_dataframe(path: Path, header: RinexHeader, dataframe) 
 
 
 def main(argv=None) -> int:
-    default_file = Path(__file__).resolve().parent / "Data" / "kepa3150.13o"
+    default_file = Path(__file__).resolve().parent / "Data_2" / "kepa3150.13o"
     argument_parser = argparse.ArgumentParser(
         description="Parse and summarize a RINEX 2 observation file."
     )
