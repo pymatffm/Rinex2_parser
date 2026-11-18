@@ -2,10 +2,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from main import (
+from rinex_2_tool import (
     open_observation_file,
     read_observation_dataframe,
-    summarize_observation_file,
 )
 
 
@@ -57,14 +56,6 @@ class RinexObservationParserTests(unittest.TestCase):
         self.assertEqual(epoch.observations["G01"][0].value, 123.5)
         self.assertEqual(epoch.observations["G01"][0].loss_of_lock_indicator, 1)
         self.assertEqual(epoch.observations["G01"][1].signal_strength, 6)
-
-    def test_summary_counts_parsed_values(self):
-        summary = summarize_observation_file(self.file_path)
-
-        self.assertIn("Observation epochs: 1", summary)
-        self.assertIn("Satellite-epochs: 1", summary)
-        self.assertIn("Valid observation values: 2", summary)
-        self.assertIn("Satellites: G01", summary)
 
     def test_dataframe_tracks_each_satellite_at_each_epoch(self):
         header, dataframe = read_observation_dataframe(self.file_path)

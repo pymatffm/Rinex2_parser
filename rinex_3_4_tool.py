@@ -17,6 +17,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -25,6 +26,16 @@ import pandas as pd
 
 SYSTEMS = {"G": "GPS", "E": "Galileo", "C": "BeiDou", "R": "GLONASS",
            "J": "QZSS", "I": "NavIC", "S": "SBAS"}
+
+
+def _version_output_dir(outdir, version: float) -> Path:
+    return Path(outdir) / "v{:03d}".format(round(version * 100))
+
+
+def _dated_path(outdir: Path, filename: str, date_stamp: str) -> Path:
+    path = Path(filename)
+    return outdir / "{}_{}{}".format(path.stem, date_stamp, path.suffix)
+
 
 # ---------------------------------------------------------------- time scales
 # (UTC date the offset takes effect, TAI-UTC in seconds after that instant)
@@ -514,13 +525,16 @@ def visibility(df: pd.DataFrame) -> pd.DataFrame:
     return t
 
 
-def make_plots(df: pd.DataFrame, outdir: Path, title: str = "") -> List[Path]:
+def make_plots(
+    df: pd.DataFrame, outdir: Path, title: str = "", date_stamp: Optional[str] = None
+) -> List[Path]:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
 
     outdir.mkdir(parents=True, exist_ok=True)
+    date_stamp = date_stamp or date.today().strftime("%d%m%y")
     colors = {"G": "#1f77b4", "E": "#2ca02c", "C": "#d62728", "R": "#9467bd",
               "J": "#8c564b", "I": "#e377c2", "S": "#7f7f7f"}
     files = []
@@ -540,7 +554,7 @@ def make_plots(df: pd.DataFrame, outdir: Path, title: str = "") -> List[Path]:
         ax.xaxis.set_major_formatter(fmt)
         ax.grid(alpha=.3)
         ax.legend(ncol=3, fontsize=8)
-        p = outdir / "snr_vs_time.png"
+        p = _dated_path(outdir, "snr_vs_time.png", date_stamp)
         fig.tight_layout()
         fig.savefig(p, dpi=150)
         plt.close(fig)
@@ -554,7 +568,7 @@ def make_plots(df: pd.DataFrame, outdir: Path, title: str = "") -> List[Path]:
                    showfliers=False)
         ax.set(ylabel="C/N0 (dB-Hz)", title="SNR distribution by signal")
         ax.grid(alpha=.3, axis="y")
-        p = outdir / "snr_distribution.png"
+        p = _dated_path(outdir, "snr_distribution.png", date_stamp)
         fig.tight_layout()
         fig.savefig(p, dpi=150)
         plt.close(fig)
@@ -575,7 +589,7 @@ def make_plots(df: pd.DataFrame, outdir: Path, title: str = "") -> List[Path]:
     ax.grid(alpha=.3)
     ax.legend(loc="upper center", bbox_to_anchor=(.5, -0.12), ncol=4,
               fontsize=8, frameon=False)
-    p = outdir / "satellite_count.png"
+    p = _dated_path(outdir, "satellite_count.png", date_stamp)
     fig.tight_layout()
     fig.savefig(p, dpi=150)
     plt.close(fig)
@@ -593,7 +607,7 @@ def make_plots(df: pd.DataFrame, outdir: Path, title: str = "") -> List[Path]:
     ax.set(xlabel="Observation time (file scale)", title="Satellite tracking timeline")
     ax.xaxis.set_major_formatter(fmt)
     ax.grid(alpha=.3, axis="x")
-    p = outdir / "satellite_timeline.png"
+    p = _dated_path(outdir, "satellite_timeline.png", date_stamp)
     fig.tight_layout()
     fig.savefig(p, dpi=150)
     plt.close(fig)
@@ -602,22 +616,27 @@ def make_plots(df: pd.DataFrame, outdir: Path, title: str = "") -> List[Path]:
 
 
 def export_all(obs_path, outdir, systems="GEC") -> dict:
-    outdir = Path(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
     header, df = read_obs(obs_path, systems)
+    outdir = _version_output_dir(outdir, header.version)
+    outdir.mkdir(parents=True, exist_ok=True)
+    date_stamp = date.today().strftime("%d%m%y")
     summary = summarize(header, df)
     cp = carrier_phase_and_pseudorange(df)
-    df.to_csv(outdir / "observations_long.csv", index=False)
-    cp.to_csv(outdir / "phase_pseudorange.csv", index=False)
-    observations_wide(df).to_csv(outdir / "observations_wide.csv", index=False)
+    df.to_csv(_dated_path(outdir, "observations_long.csv", date_stamp), index=False)
+    cp.to_csv(_dated_path(outdir, "phase_pseudorange.csv", date_stamp), index=False)
+    observations_wide(df).to_csv(
+        _dated_path(outdir, "observations_wide.csv", date_stamp), index=False
+    )
     snr = snr_table(df)
-    snr.to_csv(outdir / "snr_stats.csv", index=False)
-    visibility(df).to_csv(outdir / "visibility.csv")
+    snr.to_csv(_dated_path(outdir, "snr_stats.csv", date_stamp), index=False)
+    visibility(df).to_csv(_dated_path(outdir, "visibility.csv", date_stamp))
     comp = (df.groupby(["system", "code"]).size().rename("n_obs").reset_index())
-    comp.to_csv(outdir / "observation_counts.csv", index=False)
-    with open(outdir / "summary.json", "w") as fh:
+    comp.to_csv(_dated_path(outdir, "observation_counts.csv", date_stamp), index=False)
+    with open(_dated_path(outdir, "summary.json", date_stamp), "w") as fh:
         json.dump(summary, fh, indent=2, default=str)
-    summary["plots"] = [str(p) for p in make_plots(df, outdir, f"({header.marker_name})")]
+    summary["plots"] = [
+        str(p) for p in make_plots(df, outdir, f"({header.marker_name})", date_stamp)
+    ]
     return summary
 
 
@@ -626,10 +645,11 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     o = sub.add_parser("obs", help="parse observation file, export CSV/JSON/plots")
-    o.add_argument("file"); o.add_argument("-o", "--out", default="rinex_out")
+    default_out = Path(__file__).resolve().parent / "Data_3_4" / "output"
+    o.add_argument("file"); o.add_argument("-o", "--out", default=default_out)
     o.add_argument("--systems", default="GEC")
     n = sub.add_parser("nav", help="parse navigation file, export ephemeris CSV")
-    n.add_argument("file"); n.add_argument("-o", "--out", default="rinex_out")
+    n.add_argument("file"); n.add_argument("-o", "--out", default=default_out)
     n.add_argument("--systems", default="GEC")
     a = ap.parse_args(argv)
     if a.cmd == "obs":
@@ -638,10 +658,14 @@ def main(argv=None):
                          indent=2, default=str))
     else:
         nav = read_nav(a.file, a.systems)
-        out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-        nav.ephemeris.drop(columns=["raw"], errors="ignore").to_csv(out / "ephemeris.csv", index=False)
-        nav.sto.to_csv(out / "sto.csv", index=False)
-        nav.ion.to_csv(out / "ion.csv", index=False)
+        out = _version_output_dir(a.out, nav.version)
+        out.mkdir(parents=True, exist_ok=True)
+        date_stamp = date.today().strftime("%d%m%y")
+        nav.ephemeris.drop(columns=["raw"], errors="ignore").to_csv(
+            _dated_path(out, "ephemeris.csv", date_stamp), index=False
+        )
+        nav.sto.to_csv(_dated_path(out, "sto.csv", date_stamp), index=False)
+        nav.ion.to_csv(_dated_path(out, "ion.csv", date_stamp), index=False)
         print(f"RINEX {nav.version}: {len(nav.ephemeris)} EPH, {len(nav.sto)} STO, "
               f"{len(nav.ion)} ION records")
         if not nav.ephemeris.empty:

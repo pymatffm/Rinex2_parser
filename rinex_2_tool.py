@@ -221,11 +221,6 @@ def open_observation_file(path: Path):
         yield header, _iter_epochs(stream, header)
 
 
-def summarize_observation_file(path: Path) -> str:
-    header, dataframe = read_observation_dataframe(path)
-    return summarize_observation_dataframe(path, header, dataframe)
-
-
 def read_observation_dataframe(path: Path):
     """Return the RINEX header and a wide DataFrame indexed by epoch and satellite.
 
