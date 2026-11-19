@@ -1,5 +1,5 @@
 # Introduction
-This repository provides scripts for parsing RINEX 2, 3, and 4 files and exporting observation and
+This repository provides scripts for parsing RINEX 2, RINEX 3, and RINEX 4 files and exporting observation and
 navigation data to CSV for all GNSS constellations.
 
 For RINEX 2 data, the parsers can also generate per-satellite elevation and
@@ -7,14 +7,14 @@ azimuth files, similar to those produced by the legacy teqc utility. A separate
 visualization command generates satellite plots and pierce-point maps from the
 parser outputs.
 
-RINEX 3 and 4 also support generating elevation and azimuth files. Differential
-code bias (DCB) corrections from external files are not currently applied.
+RINEX 3 and RINEX 4 also support generating elevation and azimuth files. Differential
+code bias (DCB) corrections from external files are not currently applied (WIP).
 
-NB: The original code was written in 2015 with Python 2.7 and has been updated to Python 3.9+ with a
-focus on RINEX 3/4 support. The RINEX 2 parser is included for legacy support. The revamped new code has
+NB: The original code was written in 2015 with Python 2.7 and has since been updated to Python 3.9+ with a
+focus on RINEX 3 / RINEX 4 support. The RINEX 2 parser is included for legacy support. The revamped new code has
 been tested against the original teqc output with 2-decimal precision and is expected to produce equivalent
 results. Lastly, the code has been refactored to use a more object-oriented approach, with a focus on maintainability and extensibility.
-Copilot is used to generate the initial code structure and boilerplate, which has been modified to suit the specific needs of this project.
+Copilot is used to generate the code structure and boilerplate, which has been modified to suit the specific needs of this project.
 
 
 # RINEX 2 Parser
@@ -34,7 +34,7 @@ Specify a RINEX 2 observation file (place RINEX 2 files in the `Data/` directory
 python3 rinex_2_tool.py Data/kepa3150.13o
 ```
 
-Recommended with `uv`, you don’t need to activate the environment to run a command—use uv run, for example:
+Recommended with `uv`, because you don’t need to activate the environment to run a command—use uv run, for example:
 
 ```shell
 uv run python3 rinex_2_tool.py Data/kepa3150.13o
@@ -42,15 +42,7 @@ uv run python3 rinex_2_tool.py Data/kepa3150.13o
 
 The parser API also returns a pandas DataFrame with one row per epoch/satellite.
 Its index is `(epoch, satellite)` and its MultiIndex columns contain each
-observation type's `value`, `lli` (Loss of Lock Indicator), and `signal_strength` fields:
-
-```python
-from pathlib import Path
-from rinex_2_tool import read_observation_dataframe
-
-header, observations = read_observation_dataframe(Path("Data_2/kepa3150.13o"))
-print(observations.loc[(slice(None), "R21"), ("L1", "value")])
-```
+observation type's `value`, `lli` (Loss of Lock Indicator), and `signal_strength` fields.
 
 The CSV is written automatically to `Data_2/output/`, using the input filename
 with `.csv` appended. `--csv` changes the output filename while keeping it in
@@ -82,20 +74,22 @@ choose another output directory. Angle files cover the observation time span
 available in the input file. The generated files were benchmarked against the
 provided TEQC output over its overlapping two-hour span.
 
-Calculate code-based slant and vertical TEC from the observation file and
-matching compact elevation file:
+Calculate slant and vertical TEC from dual-frequency code and carrier-phase
+observations plus the matching compact elevation file:
 
 ```sh
 uv run python3 rinex_2_tool.py tec Data_2/kepa3170.13o
 ```
 
-The CSV is written to `Data_2/output/kepa3170_tec.csv`. The calculation uses
-P1/P2 when both are available, otherwise C1/C2, smooths code STEC with the L1/L2
-carrier-phase geometry-free change using a 100-second Hatch filter, and applies
-a 350 km thin-shell mapping height by default (`--shell-height KM` changes it).
-Since no DCB correction is applied, the STEC/VTEC columns are explicitly
-uncalibrated estimates. Plotting is a separate step, so the TEC CSV can be
-processed independently of the parser:
+The CSV is written to `Data_2/output/kepa3170_tec.csv`. Code pseudoranges
+(P1/P2 when available, otherwise C1/C2) provide the TEC level, while changes
+in the L1/L2 carrier-phase geometry-free measurement smooth it with a
+100-second Hatch filter. The output also includes a carrier-phase-only STEC
+estimate, which is precise in relative changes but has an unresolved ambiguity
+offset. A 350 km thin-shell mapping height is used by default
+(`--shell-height KM` changes it). Since no DCB correction is applied, the
+STEC/VTEC estimates are uncalibrated. Plotting is a separate step, so the TEC
+CSV can be processed independently of the parser:
 
 ```sh
 uv run python3 rinex_visualization.py tec Data_2/output/kepa3170_tec.csv
@@ -111,25 +105,11 @@ offset.
 The reusable calculation API is in `tec_calculation.py`. It accepts normalized
 observation rows (`epoch`, `satellite`, two code measurements, two phase
 measurements, their frequencies, LLI flags, and `code_pair`) plus elevation
-rows (`epoch`, `satellite`, `elevation_deg`). For RINEX 3/4 long-form parser
-output, normalize the selected signal pair per constellation, then call the
-same calculator:
-
-```python
-from tec_calculation import calculate_tec_dataframe, normalize_long_observations
-
-normalized = normalize_long_observations(
-    observations_long,
-    {"G": ("C1C", "C2W", "L1C", "L2W", 1575.42e6, 1227.60e6)},
-)
-tec = calculate_tec_dataframe(
-    normalized, elevations, time_system="GPS"
-)
-```
+rows (`epoch`, `satellite`, `elevation_deg`). 
 
 Signal selection and carrier frequencies are explicit so callers can choose
 compatible signals for each constellation. Epochs in the observation and
-elevation tables must use the same time scale.
+elevation tables must use the same timescale.
 
 Generate a pierce-point map from compact azimuth/elevation results using the
 receiver's geodetic coordinates:
@@ -141,6 +121,45 @@ uv run python3 rinex_visualization.py map \
   --latitude LATITUDE --longitude LONGITUDE
 ```
 
+For a station-centered map independent of the RINEX parsers and satellite
+inputs, use `map_generation.py` directly:
+
+```sh
+uv run python3 map_generation.py \
+  --latitude 36.2 --longitude 34.3 --output output/station_map.png
+```
+
+An optional CSV with `elevation_deg` and `azimuth_deg` columns adds thin-shell
+ionospheric pierce points:
+
+```sh
+uv run python3 map_generation.py \
+  --latitude 36.2 --longitude 34.3 \
+  --angles satellite_angles.csv \
+  --shell-height 350 \
+  --output output/station_ipp_map.png
+```
+
+The original `plot_map_globals`, `funky_earth_plot`, and `plot_map` plot types
+are also available as independent functions and CLI modes. Global and globe
+views need only station coordinates:
+
+```sh
+uv run python3 map_generation.py --mode global \
+  --latitude LAT --longitude LON --output output/global.png
+uv run python3 map_generation.py --mode funky-earth \
+  --latitude LAT --longitude LON --output output/globe.png
+```
+
+For `--mode tracks`, pass a CSV with `satellite`, `latitude_deg`, and
+`longitude_deg` columns:
+
+```sh
+uv run python3 map_generation.py --mode tracks \
+  --latitude LAT --longitude LON --tracks pierce_points.csv \
+  --output output/tracks.png
+```
+
 A test suite is included in `tests/` with synthetic RINEX 2 files generated by `tests/make_sample.py` (simulated GPS+GLONASS observables, 114 sats, cycle slips, LLI/SSI flags); `example_out/` holds pre-generated samples and full CLI output.            
 Parser tests:
 
@@ -149,11 +168,11 @@ uv run python3 -m unittest discover -s tests -v
 ```
 
 
-# RINEX 3/4 Parser and GNSS Data Extraction
+# RINEX 3/ RINEX 4 Parser and GNSS Data Extraction
 
-Pure-Python parser for RINEX 3.x and 4.00 observation and navigation files
+Pure-Python parser for RINEX 3.x and RINEX 4.00 observation and navigation files
 (GPS, Galileo, BeiDou first-class; GLONASS/QZSS/NavIC/SBAS parsed generically),
-with time-scale conversion (GPST / UTC / TAI / BDT / GST), tidy pandas
+with timescale conversion (GPST/UTC/TAI/BDT/GST), tidy pandas
 extraction and summary statistics. Plotting is provided separately by
 `rinex_visualization.py`.
 
@@ -180,13 +199,13 @@ Requires: Python >= 3.9, numpy, pandas, matplotlib (pytest for the tests). These
 
 For example, `--systems GREC` selects GPS, GLONASS, Galileo, and BeiDou.
 
-RINEX 3/4 source files belong in `Data_3_4/input/`. By default, generated files
+RINEX 3 / RINEX 4 source files belong in `Data_3_4/input/`. By default, generated files
 go to `Data_3_4/output/v304/` or `Data_3_4/output/v400/`, according to the
 input version. Use `-o` to choose a different output root; the version-specific
 subdirectory is still created. Every generated filename gets the local run date
 in `DDMMYY` format, such as `observations_long_181126.csv`.
 
-`obs` writes `observations_long_DDMMYY.csv` (tidy: one row per satellite/epoch/signal,
+`obs` writes `observations_long_DDMMYY.csv` (one row per satellite/epoch/signal,
 with time in the file scale plus GPST/UTC/TAI), `phase_pseudorange_DDMMYY.csv`,
 `observations_wide_DDMMYY.csv` (one row per sat/epoch, one column per code),
 `snr_stats_DDMMYY.csv`, `visibility_DDMMYY.csv`, `observation_counts_DDMMYY.csv`,
@@ -200,8 +219,7 @@ uv run python3 rinex_visualization.py observations \
 ## Azimuth and Elevation
 The shared visualization module also accepts compact azimuth/elevation files
 from any parser that produces that format. `nav` writes
-`ephemeris_DDMMYY.csv` (Keplerian + clock parameters, TOC in the file's time
-scale and GPST), plus `sto_DDMMYY.csv` / `ion_DDMMYY.csv` for RINEX 4
+`ephemeris_DDMMYY.csv` (Keplerian + clock parameters, TOC in the file's timescale and GPST), plus `sto_DDMMYY.csv` / `ion_DDMMYY.csv` for RINEX 4
 system-time offset and ionosphere records.
 
 `angles` uses the observation receiver coordinates and broadcast ephemerides
@@ -213,14 +231,14 @@ uv run python3 rinex_3_4_tool.py angles \
   Data_3_4/input/station.24o Data_3_4/input/brdc.24n
 ```
 
-The files use the same `COMPACT2` format as the RINEX 2 geometry output and can
+The files use the same `COMPACT2` TEQC format as the RINEX 2 geometry output and can
 be supplied to the shared TEC calculation.
 Use `--systems E` for a Galileo-only navigation file such as
 `MERS00TUR_R_20230370000_01D_EN.rnx`. Geometry is computed only for satellites
 present in both the observation epoch and the selected navigation ephemerides,
-so selecting the available constellation also avoids unnecessary orbit work.
+so selecting the available constellation also avoids unnecessary orbit work (this significantally reduces processing time).
 
-Calculate uncalibrated STEC/VTEC from the RINEX 3/4 observations and generated
+Calculate uncalibrated STEC/VTEC from the RINEX 3/ RINEX 4 observations and generated
 elevations, then plot the resulting CSV separately:
 
 ```sh
