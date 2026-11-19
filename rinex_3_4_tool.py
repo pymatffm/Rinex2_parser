@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rinex_tool - RINEX 3.x / 4.x observation and navigation parser, time-scale
-conversion, tidy pandas extraction, summary statistics and plots.
+conversion, tidy pandas extraction and summary statistics.
 
 Supported: GPS (G), Galileo (E), BeiDou (C) as first-class systems; R, J, I, S are
 parsed generically. RINEX 2 is rejected with a clear error.
@@ -17,15 +17,30 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+from tec_calculation import (
+    calculate_tec_dataframe as calculate_normalized_tec_dataframe,
+    elevations_from_compact_file,
+    normalize_long_observations,
+)
 
 SYSTEMS = {"G": "GPS", "E": "Galileo", "C": "BeiDou", "R": "GLONASS",
            "J": "QZSS", "I": "NavIC", "S": "SBAS"}
+_GPS_EPOCH = pd.Timestamp("1980-01-06")
+_GPS_WEEK_SECONDS = 604800.0
+_SPEED_OF_LIGHT = 299792458.0
+_EARTH_GRAVITATIONAL_CONSTANT = {
+    "G": 3.986005e14,
+    "E": 3.986004418e14,
+    "C": 3.986004418e14,
+}
+_EARTH_ROTATION_RATE = 7.2921151467e-5
+_SUPPORTED_ORBIT_SYSTEMS = frozenset(_EARTH_GRAVITATIONAL_CONSTANT)
 
 
 def _version_output_dir(outdir, version: float) -> Path:
@@ -395,11 +410,24 @@ def read_nav(path, systems: str = "GEC") -> NavData:
             tok = line[:60].split()
             hdr["iono"][tok[0]] = [_f(v) for v in tok[1:5]]
         elif lab == "TIME SYSTEM CORR":
-            tok = line[:60].split()
-            if len(tok) >= 4:
-                hdr["time_corr"][tok[0]] = {"a0": _f(tok[1]), "a1": _f(tok[2]),
-                                            "t": int(float(tok[3])),
-                                            "w": int(float(tok[4])) if len(tok) > 4 else 0}
+            tokens = line[:60].split()
+            if len(tokens) >= 5:
+                code, a0, a1, reference_time, week = tokens[:5]
+            else:
+                code = line[:4].strip()
+                a0, a1, reference_time, week = (
+                    line[4:22],
+                    line[22:38],
+                    line[38:45],
+                    line[45:50],
+                )
+            if code and str(a0).strip() and str(a1).strip() and str(reference_time).strip():
+                hdr["time_corr"][code] = {
+                    "a0": _f(a0),
+                    "a1": _f(a1),
+                    "t": int(float(reference_time)),
+                    "w": int(float(week)) if str(week).strip() else 0,
+                }
         elif lab == "LEAP SECONDS":
             hdr["leap_seconds"] = int(line[:6])
         elif lab == "END OF HEADER":
@@ -461,7 +489,7 @@ def read_nav(path, systems: str = "GEC") -> NavData:
     return NavData(ver, hdr, e_df, pd.DataFrame(sto), pd.DataFrame(ion))
 
 
-# ------------------------------------------------------------ stats & plots
+# ------------------------------------------------------------------ statistics
 _BAND_LABEL = {
     "G": {"1": "L1", "2": "L2", "5": "L5"},
     "E": {"1": "E1", "5": "E5a", "7": "E5b", "8": "E5", "6": "E6"},
@@ -525,94 +553,364 @@ def visibility(df: pd.DataFrame) -> pd.DataFrame:
     return t
 
 
-def make_plots(
-    df: pd.DataFrame, outdir: Path, title: str = "", date_stamp: Optional[str] = None
-) -> List[Path]:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
+def _satellite_position_gnss(
+    timestamp_gpst: pd.Timestamp,
+    satellite: str,
+    ephemerides: pd.DataFrame,
+    pseudorange: Optional[float],
+    ephemeris_records=None,
+) -> tuple:
+    system = satellite[0]
+    if system not in _SUPPORTED_ORBIT_SYSTEMS:
+        raise ValueError("broadcast orbit calculation is not supported for {}".format(system))
+    candidates = []
+    if ephemeris_records is None:
+        records = ephemerides[ephemerides["sat"] == satellite]
+        if records.empty:
+            raise ValueError("navigation file has no ephemeris for {}".format(satellite))
+        record_rows = []
+        required = ("sqrt_a", "e", "m0", "delta_n", "omega", "omega0", "i0",
+                    "toe", "toc_gpst")
+        for _, eph in records.iterrows():
+            if pd.isna(eph.get("sv_health", 0)) or float(eph.get("sv_health", 0)) != 0:
+                continue
+            if any(pd.isna(eph.get(name)) for name in required):
+                continue
+            toc_gpst = pd.Timestamp(eph["toc_gpst"])
+            week_start = _GPS_EPOCH + pd.to_timedelta(
+                np.floor((toc_gpst - _GPS_EPOCH).total_seconds() / _GPS_WEEK_SECONDS)
+                * _GPS_WEEK_SECONDS,
+                unit="s",
+            )
+            toe_seconds = float(eph["toe"]) % _GPS_WEEK_SECONDS
+            system_time_offset = 14.0 if system == "C" else 0.0
+            toe_gpst = min(
+                (
+                    week_start + pd.to_timedelta(
+                        toe_seconds + system_time_offset + offset * _GPS_WEEK_SECONDS,
+                        unit="s",
+                    )
+                    for offset in (-1, 0, 1)
+                ),
+                key=lambda value: abs(value - toc_gpst),
+            )
+            record_rows.append((toe_gpst, eph))
+    else:
+        record_rows = ephemeris_records
 
-    outdir.mkdir(parents=True, exist_ok=True)
-    date_stamp = date_stamp or date.today().strftime("%d%m%y")
-    colors = {"G": "#1f77b4", "E": "#2ca02c", "C": "#d62728", "R": "#9467bd",
-              "J": "#8c564b", "I": "#e377c2", "S": "#7f7f7f"}
-    files = []
-    fmt = mdates.DateFormatter("%H:%M")
+    for toe_gpst, eph in record_rows:
+        tk = (timestamp_gpst - toe_gpst).total_seconds()
+        tk = (tk + _GPS_WEEK_SECONDS / 2) % _GPS_WEEK_SECONDS - _GPS_WEEK_SECONDS / 2
+        candidates.append((abs(tk), tk, eph))
+    if not candidates:
+        raise ValueError("navigation file has no healthy orbital ephemeris for {}".format(satellite))
 
-    # 1. SNR vs time, mean per system/band
-    s = df[df["type"] == "S"].copy()
-    if not s.empty:
-        s["signal"] = [band_label(a, b) for a, b in zip(s["system"], s["band"])]
-        fig, ax = plt.subplots(figsize=(11, 5))
-        for (sy, sig), g in s.groupby(["system", "signal"]):
-            m = g.groupby("time_gpst")["value"].mean()
-            ax.plot(m.index, m.values, lw=1.2, label=f"{SYSTEMS.get(sy, sy)} {sig}",
-                    color=colors.get(sy), ls=["-", "--", ":", "-."][hash(sig) % 4])
-        ax.set(xlabel="GPST", ylabel="Mean C/N0 (dB-Hz)",
-               title=f"Signal-to-noise ratio over time {title}".strip())
-        ax.xaxis.set_major_formatter(fmt)
-        ax.grid(alpha=.3)
-        ax.legend(ncol=3, fontsize=8)
-        p = _dated_path(outdir, "snr_vs_time.png", date_stamp)
-        fig.tight_layout()
-        fig.savefig(p, dpi=150)
-        plt.close(fig)
-        files.append(p)
+    _, tk, eph = min(candidates, key=lambda value: value[0])
+    sqrt_a = float(eph["sqrt_a"])
+    eccentricity = float(eph["e"])
+    if sqrt_a <= 0 or not 0 <= eccentricity < 1:
+        raise ValueError("invalid orbital parameters for {}".format(satellite))
+    semi_major_axis = sqrt_a * sqrt_a
+    mean_motion = np.sqrt(_EARTH_GRAVITATIONAL_CONSTANT[system] / semi_major_axis ** 3)
+    mean_anomaly = float(eph["m0"]) + (
+        mean_motion + float(eph.get("delta_n", 0.0))
+    ) * tk
+    eccentric_anomaly = mean_anomaly
+    for _ in range(20):
+        updated = mean_anomaly + eccentricity * np.sin(eccentric_anomaly)
+        if abs(updated - eccentric_anomaly) < 1e-13:
+            eccentric_anomaly = updated
+            break
+        eccentric_anomaly = updated
 
-        # 2. SNR distribution per system/band
-        fig, ax = plt.subplots(figsize=(11, 5))
-        groups = [(f"{sy}\n{sig}", g["value"].values)
-                  for (sy, sig), g in s.groupby(["system", "signal"])]
-        ax.boxplot([g for _, g in groups], tick_labels=[n for n, _ in groups],
-                   showfliers=False)
-        ax.set(ylabel="C/N0 (dB-Hz)", title="SNR distribution by signal")
-        ax.grid(alpha=.3, axis="y")
-        p = _dated_path(outdir, "snr_distribution.png", date_stamp)
-        fig.tight_layout()
-        fig.savefig(p, dpi=150)
-        plt.close(fig)
-        files.append(p)
+    true_anomaly = np.arctan2(
+        np.sqrt(1 - eccentricity * eccentricity) * np.sin(eccentric_anomaly),
+        np.cos(eccentric_anomaly) - eccentricity,
+    )
+    argument = true_anomaly + float(eph["omega"])
+    twice_argument = 2 * argument
+    argument += (
+        float(eph.get("cus", 0.0)) * np.sin(twice_argument)
+        + float(eph.get("cuc", 0.0)) * np.cos(twice_argument)
+    )
+    radius = (
+        semi_major_axis * (1 - eccentricity * np.cos(eccentric_anomaly))
+        + float(eph.get("crs", 0.0)) * np.sin(twice_argument)
+        + float(eph.get("crc", 0.0)) * np.cos(twice_argument)
+    )
+    inclination = (
+        float(eph["i0"])
+        + float(eph.get("idot", 0.0)) * tk
+        + float(eph.get("cis", 0.0)) * np.sin(twice_argument)
+        + float(eph.get("cic", 0.0)) * np.cos(twice_argument)
+    )
+    orbital_x = radius * np.cos(argument)
+    orbital_y = radius * np.sin(argument)
+    longitude = (
+        float(eph["omega0"])
+        + (float(eph.get("omega_dot", 0.0)) - _EARTH_ROTATION_RATE) * tk
+        - _EARTH_ROTATION_RATE * float(eph["toe"])
+    )
+    x = orbital_x * np.cos(longitude) - orbital_y * np.cos(inclination) * np.sin(longitude)
+    y = orbital_x * np.sin(longitude) + orbital_y * np.cos(inclination) * np.cos(longitude)
+    z = orbital_y * np.sin(inclination)
 
-    # 3. satellites visible vs time
-    vis = visibility(df)
-    fig, ax = plt.subplots(figsize=(11, 5))
-    syss = [c for c in vis.columns if c != "total"]
-    ax.stackplot(vis.index, [vis[c] for c in syss],
-                 labels=[SYSTEMS.get(c, c) for c in syss],
-                 colors=[colors.get(c) for c in syss], alpha=.85)
-    ax.plot(vis.index, vis["total"], "k-", lw=.8, label="Total")
-    ax.set(xlabel="Observation time (file scale)", ylabel="Satellites tracked",
-           title=f"Satellite visibility over time {title}".strip(),
-           ylim=(0, vis["total"].max() * 1.15))
-    ax.xaxis.set_major_formatter(fmt)
-    ax.grid(alpha=.3)
-    ax.legend(loc="upper center", bbox_to_anchor=(.5, -0.12), ncol=4,
-              fontsize=8, frameon=False)
-    p = _dated_path(outdir, "satellite_count.png", date_stamp)
-    fig.tight_layout()
-    fig.savefig(p, dpi=150)
-    plt.close(fig)
-    files.append(p)
+    if system == "C" and (1 <= int(satellite[1:]) <= 5 or int(satellite[1:]) >= 59):
+        rotation = _EARTH_ROTATION_RATE * tk
+        tilt = np.radians(-5.0)
+        x, y, z = (
+            x * np.cos(rotation) + y * np.sin(rotation) * np.cos(tilt)
+            + z * np.sin(rotation) * np.sin(tilt),
+            -x * np.sin(rotation) + y * np.cos(rotation) * np.cos(tilt)
+            + z * np.cos(rotation) * np.sin(tilt),
+            -y * np.sin(tilt) + z * np.cos(tilt),
+        )
 
-    # 4. per-satellite visibility timeline
-    v = df.drop_duplicates(["time", "sat"])
-    sats = sorted(v["sat"].unique())
-    idx = {s_: k for k, s_ in enumerate(sats)}
-    fig, ax = plt.subplots(figsize=(11, max(4, .22 * len(sats) + 1.5)))
-    ax.scatter(v["time"], v["sat"].map(idx), s=6, marker="|",
-               c=[colors.get(x) for x in v["system"]])
-    ax.set_yticks(range(len(sats)))
-    ax.set_yticklabels(sats, fontsize=7)
-    ax.set(xlabel="Observation time (file scale)", title="Satellite tracking timeline")
-    ax.xaxis.set_major_formatter(fmt)
-    ax.grid(alpha=.3, axis="x")
-    p = _dated_path(outdir, "satellite_timeline.png", date_stamp)
-    fig.tight_layout()
-    fig.savefig(p, dpi=150)
-    plt.close(fig)
-    files.append(p)
-    return files
+    if pseudorange is not None and pseudorange > 0:
+        rotation = _EARTH_ROTATION_RATE * pseudorange / _SPEED_OF_LIGHT
+        x, y = (
+            x * np.cos(rotation) + y * np.sin(rotation),
+            -x * np.sin(rotation) + y * np.cos(rotation),
+        )
+    return float(x), float(y), float(z)
+
+
+def _azimuth_elevation_gnss(satellite_xyz: tuple, receiver_xyz: tuple) -> tuple:
+    x, y, z = receiver_xyz
+    longitude = np.arctan2(y, x)
+    latitude = np.arctan2(z, np.hypot(x, y) * (1 - 6.69437999014e-3))
+    dx, dy, dz = (satellite_xyz[index] - receiver_xyz[index] for index in range(3))
+    east = -np.sin(longitude) * dx + np.cos(longitude) * dy
+    north = (
+        -np.sin(latitude) * np.cos(longitude) * dx
+        - np.sin(latitude) * np.sin(longitude) * dy
+        + np.cos(latitude) * dz
+    )
+    up = (
+        np.cos(latitude) * np.cos(longitude) * dx
+        + np.cos(latitude) * np.sin(longitude) * dy
+        + np.sin(latitude) * dz
+    )
+    azimuth = np.degrees(np.arctan2(east, north))
+    elevation = np.degrees(np.arctan2(up, np.hypot(east, north)))
+    return float(azimuth), float(elevation)
+
+
+def write_azimuth_elevation_files(
+    observation_path,
+    navigation_path,
+    output_dir=None,
+    sample_interval: int = 15,
+    systems: str = "GEC",
+) -> tuple[Path, Path]:
+    """Write compact azimuth/elevation files from RINEX 3/4 observation/nav data."""
+    if sample_interval <= 0:
+        raise ValueError("sample interval must be a positive number of seconds")
+    observation_path = Path(observation_path)
+    navigation_path = Path(navigation_path)
+    output_root = (
+        Path(output_dir)
+        if output_dir is not None
+        else Path(__file__).resolve().parent / "Data_3_4" / "output"
+    )
+    header, observations = read_obs(observation_path, systems)
+    if header.approx_xyz is None:
+        raise ValueError("observation header is missing APPROX POSITION XYZ")
+    nav = read_nav(navigation_path, systems)
+    ephemerides = nav.ephemeris
+    if ephemerides.empty:
+        raise ValueError("navigation file contains no supported ephemerides")
+
+    output_dir = _version_output_dir(output_root, header.version)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    azimuth_path = output_dir / (observation_path.stem + ".azi")
+    elevation_path = output_dir / (observation_path.stem + ".ele")
+    epochs = pd.DatetimeIndex(observations["time"].drop_duplicates().sort_values())
+    if epochs.empty:
+        raise ValueError("observation file contains no usable epochs")
+    first_epoch = epochs[0]
+    previous_satellites = None
+    receiver_xyz = header.approx_xyz
+    navigation_satellites = _supported_satellites(ephemerides, systems)
+    if not navigation_satellites:
+        raise ValueError("navigation file has no healthy GPS/Galileo/BeiDou ephemerides")
+    ephemerides_by_satellite = _prepare_ephemerides(ephemerides)
+    satellites_by_epoch = (
+        observations.loc[:, ["time", "sat"]]
+        .drop_duplicates()
+        .groupby("time", sort=False)["sat"]
+        .agg(tuple)
+        .to_dict()
+    )
+    pseudorange_rows = observations.loc[
+        (observations["type"] == "C") & (observations["value"] > 0),
+        ["time", "sat", "value"],
+    ].drop_duplicates(["time", "sat"])
+    pseudoranges_by_epoch = {
+        epoch: dict(zip(rows["sat"], rows["value"]))
+        for epoch, rows in pseudorange_rows.groupby("time", sort=False)
+    }
+
+    with (
+        azimuth_path.open("w", encoding="ascii", newline="\n") as azimuth_file,
+        elevation_path.open("w", encoding="ascii", newline="\n") as elevation_file,
+    ):
+        for output_file in (azimuth_file, elevation_file):
+            output_file.write("COMPACT2\n")
+            output_file.write("T_SAMP    {:0.4f}\n".format(sample_interval))
+            mjd = (
+                first_epoch - pd.Timestamp("1858-11-17")
+            ).total_seconds() / 86400.0
+            output_file.write("START_TIME_MJD  {:0.9f}\n".format(mjd))
+
+        for epoch in epochs:
+            elapsed = (epoch - first_epoch).total_seconds()
+            if round(elapsed) % sample_interval:
+                continue
+            observed_satellites = set(satellites_by_epoch.get(epoch, ()))
+            satellites_to_process = sorted(
+                observed_satellites.intersection(navigation_satellites)
+            )
+            pseudoranges = pseudoranges_by_epoch.get(epoch, {})
+            epoch_gpst = to_gpst(pd.DatetimeIndex([epoch]), header.time_system)[0]
+            azimuths = []
+            elevations = []
+            for satellite in satellites_to_process:
+                position = _satellite_position_gnss(
+                    epoch_gpst,
+                    satellite,
+                    ephemerides,
+                    pseudoranges.get(satellite),
+                    ephemerides_by_satellite.get(satellite),
+                )
+                azimuth, elevation = _azimuth_elevation_gnss(position, receiver_xyz)
+                if elevation < 0:
+                    continue
+                azimuths.append((satellite, azimuth))
+                elevations.append((satellite, elevation))
+
+            satellites = tuple(satellite for satellite, _ in azimuths)
+            marker = (
+                "{} {}".format(len(satellites), " ".join(satellites))
+                if satellites != previous_satellites
+                else "-1"
+            )
+            azimuth_file.write(marker + "\n")
+            elevation_file.write(marker + "\n")
+            azimuth_file.write(
+                "".join("{:8.3f} ".format(value) for _, value in azimuths) + "\n"
+            )
+            elevation_file.write(
+                "".join("{:8.3f} ".format(value) for _, value in elevations) + "\n"
+            )
+            previous_satellites = satellites
+    return azimuth_path, elevation_path
+
+
+def calculate_tec_from_observation_file(
+    observation_path,
+    elevation_path,
+    system: str = "G",
+    code_1: str = "C1C",
+    code_2: str = "C2W",
+    phase_1: str = "L1C",
+    phase_2: str = "L2W",
+    frequency_1_hz: float = 1575.42e6,
+    frequency_2_hz: float = 1227.60e6,
+    shell_height_km: float = 350.0,
+    smoothing_window_seconds: float = 100.0,
+) -> pd.DataFrame:
+    """Calculate TEC from one explicitly selected constellation signal pair."""
+    header, observations = read_obs(observation_path, systems=system)
+    if system not in header.obs_types:
+        raise ValueError(
+            "observation file does not contain constellation {}".format(system)
+        )
+    missing_signals = {
+        code_1, code_2, phase_1, phase_2
+    } - set(header.obs_types[system])
+    if missing_signals:
+        raise ValueError(
+            "constellation {} is missing selected signal(s): {}".format(
+                system, ", ".join(sorted(missing_signals))
+            )
+        )
+    _, elevations_by_epoch = elevations_from_compact_file(elevation_path)
+    elevation_rows = [
+        {"epoch": timestamp, "satellite": satellite, "elevation_deg": elevation}
+        for timestamp, satellites in elevations_by_epoch.items()
+        for satellite, elevation in satellites.items()
+    ]
+    normalized = normalize_long_observations(
+        observations,
+        {
+            system: (
+                code_1,
+                code_2,
+                phase_1,
+                phase_2,
+                frequency_1_hz,
+                frequency_2_hz,
+            )
+        },
+    )
+    return calculate_normalized_tec_dataframe(
+        normalized,
+        pd.DataFrame.from_records(
+            elevation_rows, columns=("epoch", "satellite", "elevation_deg")
+        ),
+        shell_height_km=shell_height_km,
+        time_system=header.time_system,
+        smoothing_window_seconds=smoothing_window_seconds,
+    )
+
+
+def _supported_satellites(ephemerides: pd.DataFrame, systems: str):
+    allowed = set(systems) & _SUPPORTED_ORBIT_SYSTEMS
+    if ephemerides.empty:
+        return set()
+    available = ephemerides[ephemerides["system"].isin(allowed)]
+    if "sv_health" in available:
+        available = available[available["sv_health"].fillna(1) == 0]
+    return set(available["sat"])
+
+
+def _prepare_ephemerides(ephemerides: pd.DataFrame) -> dict:
+    required = ("sqrt_a", "e", "m0", "delta_n", "omega", "omega0", "i0",
+                "toe", "toc_gpst")
+    prepared = {}
+    for satellite, records in ephemerides.groupby("sat", sort=False):
+        system_time_offset = 14.0 if satellite[0] == "C" else 0.0
+        prepared_records = []
+        for eph in records.to_dict("records"):
+            if (
+                pd.isna(eph.get("sv_health", 0))
+                or float(eph.get("sv_health", 0)) != 0
+                or any(pd.isna(eph.get(name)) for name in required)
+            ):
+                continue
+            toc_gpst = pd.Timestamp(eph["toc_gpst"])
+            week_number = np.floor(
+                (toc_gpst - _GPS_EPOCH).total_seconds() / _GPS_WEEK_SECONDS
+            )
+            week_start = _GPS_EPOCH + pd.to_timedelta(
+                week_number * _GPS_WEEK_SECONDS, unit="s"
+            )
+            toe_seconds = float(eph["toe"]) % _GPS_WEEK_SECONDS
+            toe_gpst = min(
+                (
+                    week_start + pd.to_timedelta(
+                        toe_seconds + system_time_offset + offset * _GPS_WEEK_SECONDS,
+                        unit="s",
+                    )
+                    for offset in (-1, 0, 1)
+                ),
+                key=lambda value: abs(value - toc_gpst),
+            )
+            prepared_records.append((toe_gpst, eph))
+        if prepared_records:
+            prepared[satellite] = prepared_records
+    return prepared
 
 
 def export_all(obs_path, outdir, systems="GEC") -> dict:
@@ -634,9 +932,6 @@ def export_all(obs_path, outdir, systems="GEC") -> dict:
     comp.to_csv(_dated_path(outdir, "observation_counts.csv", date_stamp), index=False)
     with open(_dated_path(outdir, "summary.json", date_stamp), "w") as fh:
         json.dump(summary, fh, indent=2, default=str)
-    summary["plots"] = [
-        str(p) for p in make_plots(df, outdir, f"({header.marker_name})", date_stamp)
-    ]
     return summary
 
 
@@ -644,18 +939,110 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    o = sub.add_parser("obs", help="parse observation file, export CSV/JSON/plots")
+    o = sub.add_parser("obs", help="parse observation file and export CSV/JSON")
     default_out = Path(__file__).resolve().parent / "Data_3_4" / "output"
     o.add_argument("file"); o.add_argument("-o", "--out", default=default_out)
     o.add_argument("--systems", default="GEC")
     n = sub.add_parser("nav", help="parse navigation file, export ephemeris CSV")
     n.add_argument("file"); n.add_argument("-o", "--out", default=default_out)
     n.add_argument("--systems", default="GEC")
+    g = sub.add_parser(
+        "angles", help="generate compact azimuth/elevation from observation and nav files"
+    )
+    g.add_argument("obs_file")
+    g.add_argument("nav_file")
+    g.add_argument("-o", "--out", default=default_out)
+    g.add_argument("--systems", default="GEC")
+    g.add_argument("--interval", type=int, default=15)
+    t = sub.add_parser(
+        "tec", help="calculate STEC/VTEC from observations and compact elevation"
+    )
+    t.add_argument("obs_file")
+    t.add_argument("--ele", type=Path)
+    t.add_argument("--out", type=Path)
+    t.add_argument("--system", choices=("G", "E", "C"), default="G")
+    t.add_argument("--code1")
+    t.add_argument("--code2")
+    t.add_argument("--phase1")
+    t.add_argument("--phase2")
+    t.add_argument("--frequency1", type=float, metavar="HZ")
+    t.add_argument("--frequency2", type=float, metavar="HZ")
+    t.add_argument("--shell-height", type=float, default=350.0, metavar="KM")
+    t.add_argument("--smoothing-window", type=float, default=100.0, metavar="SECONDS")
     a = ap.parse_args(argv)
     if a.cmd == "obs":
         s = export_all(a.file, a.out, a.systems)
         print(json.dumps({k: s[k] for k in s if k not in ("obs_types",)},
                          indent=2, default=str))
+    elif a.cmd == "angles":
+        try:
+            azimuth_path, elevation_path = write_azimuth_elevation_files(
+                a.obs_file, a.nav_file, a.out, a.interval, a.systems
+            )
+        except (OSError, ValueError) as error:
+            print("Error: {}".format(error), file=sys.stderr)
+            return 2
+        print("Azimuth written to: {}".format(azimuth_path))
+        print("Elevation written to: {}".format(elevation_path))
+    elif a.cmd == "tec":
+        observation_path = Path(a.obs_file)
+        try:
+            header, _ = read_obs(observation_path, systems=a.system)
+            signal_defaults = {
+                "G": ("C1C", "C2W", "L1C", "L2W", 1575.42e6, 1227.60e6),
+                "E": ("C1C", "C5Q", "L1C", "L5Q", 1575.42e6, 1176.45e6),
+                "C": ("C2I", "C7I", "L2I", "L7I", 1561.098e6, 1207.14e6),
+            }
+            defaults = signal_defaults[a.system]
+            selected = (
+                a.code1 or defaults[0],
+                a.code2 or defaults[1],
+                a.phase1 or defaults[2],
+                a.phase2 or defaults[3],
+                a.frequency1 or defaults[4],
+                a.frequency2 or defaults[5],
+            )
+            explicit_csv = a.out and Path(a.out).suffix.lower() == ".csv"
+            output_dir = (
+                Path(a.out).parent
+                if explicit_csv
+                else _version_output_dir(a.out or default_out, header.version)
+            )
+            elevation_path = a.ele or (output_dir / (observation_path.stem + ".ele"))
+            output_path = (
+                Path(a.out)
+                if explicit_csv
+                else output_dir / (observation_path.stem + "_tec.csv")
+            )
+            tec = calculate_tec_from_observation_file(
+                observation_path,
+                elevation_path,
+                system=a.system,
+                code_1=selected[0],
+                code_2=selected[1],
+                phase_1=selected[2],
+                phase_2=selected[3],
+                frequency_1_hz=selected[4],
+                frequency_2_hz=selected[5],
+                shell_height_km=a.shell_height,
+                smoothing_window_seconds=a.smoothing_window,
+            )
+            if tec.empty:
+                raise ValueError(
+                    "no matching epochs with dual-frequency observations and elevation"
+                )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            tec.to_csv(output_path, index=False)
+        except (OSError, ValueError, KeyError) as error:
+            print("Error: {}".format(error), file=sys.stderr)
+            return 2
+        print("TEC rows: {}".format(len(tec)))
+        print("Output written to: {}".format(output_path))
+        print(
+            "Generate plots with: python3 rinex_visualization.py tec {}".format(
+                output_path
+            )
+        )
     else:
         nav = read_nav(a.file, a.systems)
         out = _version_output_dir(a.out, nav.version)
@@ -670,6 +1057,7 @@ def main(argv=None):
               f"{len(nav.ion)} ION records")
         if not nav.ephemeris.empty:
             print(nav.ephemeris.groupby("system").size().to_string())
+    return 0
 
 
 if __name__ == "__main__":
