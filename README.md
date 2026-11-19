@@ -265,20 +265,6 @@ valid DCB corrections are applied separately. `.azi` is not needed for VTEC.
 
 With `uv`, you don’t need to activate the environment to run a command—use `uv run`, for example:
 
-```shell
-uv run python rinex_3_4_tool.py obs Data_3_4/input/sample_v304.24o --systems E
-```
-
-## API
-
-    from rinex_3_4_tool import read_obs, read_nav, to_gpst, convert_time, gps_week_tow
-
-    header, df = read_obs("Data_3_4/input/SITE001.24o")  # df: tidy DataFrame
-    header.approx_xyz                        # antenna XYZ from the header
-    header.approx_llh                         # derived geodetic position
-    header.obs_types                          # {"G": ["C1C", ...], ...}
-    to_gpst(t, "BDT"); convert_time(t, "UTC", "TAI")
-    nav = read_nav("Data_3_4/input/SITE001.24n"); nav.ephemeris
 
 ## Time scales
 
