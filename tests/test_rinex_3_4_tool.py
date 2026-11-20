@@ -5,7 +5,24 @@ sys.path.insert(0, str(pathlib.Path(__file__).parents[1]))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import numpy as np, pandas as pd, pytest
 import rinex_3_4_tool as rt, make_sample as ms
+import rinex_visualization as viz
 from rinex_visualization import plot_observation_diagnostics
+
+
+def test_plot_context_uses_station_and_recording_dates():
+    observations = pd.DataFrame(
+        {
+            "time": pd.to_datetime(["2024-03-15 00:00", "2024-03-15 00:02"]),
+            "time_utc": pd.to_datetime(["2024-03-14 23:59", "2024-03-15 00:01"]),
+        }
+    )
+    assert viz._observation_plot_context(observations, "", "MERS00TUR") == (
+        "MERS00TUR - 2024-03-14 to 2024-03-15"
+    )
+    assert viz._station_from_filename(
+        pathlib.Path("MERS00TUR_R_20240740000_01D_30S_MO.rnx")
+    ) == "MERS00TUR"
+
 
 @pytest.fixture(scope="module", params=[3.04, 4.00])
 def obs(request, tmp_path_factory):

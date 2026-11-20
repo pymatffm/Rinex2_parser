@@ -16,6 +16,27 @@ been tested against the original teqc output with 2-decimal precision and is exp
 results. Lastly, the code has been refactored to use a more object-oriented approach, with a focus on maintainability and extensibility.
 Copilot is used to generate the code structure and boilerplate, which has been modified to suit the specific needs of this project.
 
+## Installable CLI
+
+The project is organized as the `rinex_parser` package and provides one CLI
+entry point. From a checkout, install the project and its dependencies with
+`uv sync`; the command is then available through `uv run`:
+
+```sh
+uv sync
+uv run rinex --help
+uv run rinex rinex2 Data_2/kepa3150.13o
+uv run rinex rinex2 nav Data_2/brdc3170.13n
+uv run rinex rinex34 obs Data_3_4/input/sample_v400.24o
+uv run rinex plot tec Data_2/output/kepa3170_tec.csv
+uv run rinex map --latitude 36.2 --longitude 34.3 --output output/station_map.png
+```
+
+The command groups `rinex2`, `rinex34`, `plot`, and `map` expose the existing
+parser and visualization options. `python -m rinex_parser` is also supported.
+The former top-level script names remain as compatibility wrappers, so
+existing commands such as `python3 rinex_2_tool.py ...` continue to work.
+
 
 # RINEX 2 Parser
 
@@ -216,6 +237,12 @@ Generate its SNR and satellite visibility plots separately from the long CSV:
 uv run python3 rinex_visualization.py observations \
   Data_3_4/output/v400/observations_long_DDMMYY.csv
 ```
+Plot titles include the station marker from the matching summary JSON and the
+date (or date range) recorded in the observation timestamps. If no summary is
+available, a standard RINEX filename is used to infer the station; `--station`
+can override it. The plot date reflects the observation data, not the CSV's
+local-generation-date suffix.
+
 ## Azimuth and Elevation
 The shared visualization module also accepts compact azimuth/elevation files
 from any parser that produces that format. `nav` writes

@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "rinex2-parser"
 version = "0.1.0"
-description = "Command-line parser for RINEX 2 observation files"
+description = "Command-line tools for parsing and processing RINEX GNSS data"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -9,8 +13,11 @@ dependencies = [
     "pandas>=2.3.3",
 ]
 
-[tool.uv]
-package = false
+[project.scripts]
+rinex = "rinex_parser.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [dependency-groups]
 dev = [
