@@ -158,8 +158,7 @@ def _observation_plot_context(
     parts = [title.strip()] if title.strip() else []
     if station:
         parts.append(station)
-    date_column = "time_utc" if "time_utc" in dataframe else "time"
-    parts.append(_recorded_date_label(dataframe[date_column]))
+    parts.append(_recorded_date_label(dataframe["time"]))
     return " - ".join(parts)
 
 

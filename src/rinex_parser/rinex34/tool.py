@@ -28,6 +28,7 @@ from ..tec_calculation import (
     elevations_from_compact_file,
     normalize_long_observations,
 )
+from ..dcb import geometry_free_code_correction, read_dcb_file
 
 SYSTEMS = {"G": "GPS", "E": "Galileo", "C": "BeiDou", "R": "GLONASS",
            "J": "QZSS", "I": "NavIC", "S": "SBAS"}
@@ -40,7 +41,7 @@ _EARTH_GRAVITATIONAL_CONSTANT = {
     "C": 3.986004418e14,
 }
 _EARTH_ROTATION_RATE = 7.2921151467e-5
-_SUPPORTED_ORBIT_SYSTEMS = frozenset(_EARTH_GRAVITATIONAL_CONSTANT)
+_SUPPORTED_ORBIT_SYSTEMS = frozenset(_EARTH_GRAVITATIONAL_CONSTANT) | {"R"}
 
 
 def _version_output_dir(outdir, version: float) -> Path:
@@ -390,6 +391,25 @@ def _parse_eph(rec: List[str], msg: Optional[str], toc_scale: str) -> dict:
                 if k < len(flat):
                     row[nm] = flat[k]
                 k += 1
+    elif sat[0] == "R":
+        for index, name in enumerate(
+            (
+                "x",
+                "x_dot",
+                "x_ddot",
+                "sv_health",
+                "y",
+                "y_dot",
+                "y_ddot",
+                "frequency_number",
+                "z",
+                "z_dot",
+                "z_ddot",
+                "age",
+            )
+        ):
+            if index < len(flat):
+                row[name] = flat[index]
     row["toc_scale"] = toc_scale
     return row
 
@@ -568,6 +588,50 @@ def _satellite_position_gnss(
     system = satellite[0]
     if system not in _SUPPORTED_ORBIT_SYSTEMS:
         raise ValueError("broadcast orbit calculation is not supported for {}".format(system))
+    if system == "R":
+        record_rows = (
+            ephemeris_records
+            if ephemeris_records is not None
+            else _prepare_ephemerides(ephemerides).get(satellite, ())
+        )
+        candidates = [
+            (
+                abs((timestamp_gpst - toc_gpst).total_seconds()),
+                (timestamp_gpst - toc_gpst).total_seconds(),
+                eph,
+            )
+            for toc_gpst, eph in record_rows
+        ]
+        if not candidates:
+            raise ValueError(
+                "navigation file has no healthy orbital ephemeris for {}".format(
+                    satellite
+                )
+            )
+        _, elapsed, eph = min(candidates, key=lambda value: value[0])
+        state = np.array(
+            [
+                eph["x"], eph["y"], eph["z"],
+                eph["x_dot"], eph["y_dot"], eph["z_dot"],
+            ],
+            dtype=float,
+        )
+        acceleration = np.array(
+            [eph["x_ddot"], eph["y_ddot"], eph["z_ddot"]], dtype=float
+        )
+        if not np.isfinite(state).all() or not np.isfinite(acceleration).all():
+            raise ValueError("invalid GLONASS state vector for {}".format(satellite))
+        position = _propagate_glonass_state(state, acceleration, elapsed)
+        if pseudorange is not None and pseudorange > 0:
+            rotation = _EARTH_ROTATION_RATE * pseudorange / _SPEED_OF_LIGHT
+            x, y, z = position
+            position = (
+                x * np.cos(rotation) + y * np.sin(rotation),
+                -x * np.sin(rotation) + y * np.cos(rotation),
+                z,
+            )
+        return tuple(float(value) for value in position)
+
     candidates = []
     if ephemeris_records is None:
         records = ephemerides[ephemerides["sat"] == satellite]
@@ -680,6 +744,51 @@ def _satellite_position_gnss(
     return float(x), float(y), float(z)
 
 
+def _propagate_glonass_state(
+    state: np.ndarray, broadcast_acceleration: np.ndarray, elapsed_seconds: float
+) -> np.ndarray:
+    """Propagate a GLONASS broadcast ECEF state using the ICD force model."""
+    mu = 3.9860044e14
+    earth_radius = 6378136.0
+    j2 = 1.0826257e-3
+    state = np.asarray(state, dtype=float).copy()
+    state[:3] *= 1000.0
+    state[3:] *= 1000.0
+    broadcast_acceleration = np.asarray(broadcast_acceleration, dtype=float) * 1000.0
+    steps = max(1, int(np.ceil(abs(elapsed_seconds) / 60.0)))
+    step = elapsed_seconds / steps
+
+    def derivative(value):
+        x, y, z, vx, vy, vz = value
+        radius_squared = x * x + y * y + z * z
+        radius = np.sqrt(radius_squared)
+        gravity = -mu / radius ** 3
+        j2_factor = 1.5 * j2 * mu * earth_radius ** 2 / radius ** 5
+        z_ratio = z * z / radius_squared
+        omega = _EARTH_ROTATION_RATE
+        return np.array(
+            [
+                vx,
+                vy,
+                vz,
+                (gravity + j2_factor * (1 - 5 * z_ratio) + omega ** 2) * x
+                + 2 * omega * vy + broadcast_acceleration[0],
+                (gravity + j2_factor * (1 - 5 * z_ratio) + omega ** 2) * y
+                - 2 * omega * vx + broadcast_acceleration[1],
+                (gravity + j2_factor * (3 - 5 * z_ratio)) * z
+                + broadcast_acceleration[2],
+            ]
+        )
+
+    for _ in range(steps):
+        k1 = derivative(state)
+        k2 = derivative(state + step * k1 / 2)
+        k3 = derivative(state + step * k2 / 2)
+        k4 = derivative(state + step * k3)
+        state += step * (k1 + 2 * k2 + 2 * k3 + k4) / 6
+    return state[:3]
+
+
 def _azimuth_elevation_gnss(satellite_xyz: tuple, receiver_xyz: tuple) -> tuple:
     x, y, z = receiver_xyz
     longitude = np.arctan2(y, x)
@@ -738,7 +847,15 @@ def write_azimuth_elevation_files(
     receiver_xyz = header.approx_xyz
     navigation_satellites = _supported_satellites(ephemerides, systems)
     if not navigation_satellites:
-        raise ValueError("navigation file has no healthy GPS/Galileo/BeiDou ephemerides")
+        requested_systems = ", ".join(
+            SYSTEMS.get(system, system)
+            for system in sorted(set(systems) & _SUPPORTED_ORBIT_SYSTEMS)
+        )
+        raise ValueError(
+            "navigation file has no healthy orbital ephemerides for {}".format(
+                requested_systems or "the requested systems"
+            )
+        )
     ephemerides_by_satellite = _prepare_ephemerides(ephemerides)
     satellites_by_epoch = (
         observations.loc[:, ["time", "sat"]]
@@ -824,8 +941,16 @@ def calculate_tec_from_observation_file(
     frequency_2_hz: float = 1227.60e6,
     shell_height_km: float = 350.0,
     smoothing_window_seconds: float = 100.0,
+    navigation_path=None,
+    p1p2_dcb_path=None,
+    p1c1_dcb_path=None,
 ) -> pd.DataFrame:
     """Calculate TEC from one explicitly selected constellation signal pair."""
+    if system == "R" and navigation_path is None:
+        raise ValueError(
+            "GLONASS TEC requires --nav so signal frequencies can be read "
+            "from each satellite's frequency channel"
+        )
     header, observations = read_obs(observation_path, systems=system)
     if system not in header.obs_types:
         raise ValueError(
@@ -859,6 +984,43 @@ def calculate_tec_from_observation_file(
             )
         },
     )
+    p1p2_dcb_m = (
+        read_dcb_file(p1p2_dcb_path) if p1p2_dcb_path is not None else {}
+    )
+    p1c1_dcb_m = (
+        read_dcb_file(p1c1_dcb_path) if p1c1_dcb_path is not None else {}
+    )
+    code_dcb_corrections_m = {}
+    for satellite in normalized["satellite"].dropna().unique():
+        code_dcb_corrections_m[satellite] = geometry_free_code_correction(
+            satellite,
+            code_1,
+            code_2,
+            p1p2_dcb_m,
+            p1c1_dcb_m,
+        )
+    if system == "R":
+        navigation = read_nav(navigation_path, systems="R")
+        channels = _glonass_frequency_channels(navigation.ephemeris)
+        satellites_with_elevations = {
+            row["satellite"] for row in elevation_rows
+        }
+        normalized = normalized[
+            normalized["satellite"].isin(satellites_with_elevations)
+        ].copy()
+        missing_channels = set(normalized["satellite"]) - set(channels)
+        if missing_channels:
+            raise ValueError(
+                "navigation file has no GLONASS frequency channel for {}".format(
+                    ", ".join(sorted(missing_channels))
+                )
+            )
+        normalized["frequency_1_hz"] = normalized["satellite"].map(
+            {satellite: frequencies[0] for satellite, frequencies in channels.items()}
+        )
+        normalized["frequency_2_hz"] = normalized["satellite"].map(
+            {satellite: frequencies[1] for satellite, frequencies in channels.items()}
+        )
     return calculate_normalized_tec_dataframe(
         normalized,
         pd.DataFrame.from_records(
@@ -867,7 +1029,42 @@ def calculate_tec_from_observation_file(
         shell_height_km=shell_height_km,
         time_system=header.time_system,
         smoothing_window_seconds=smoothing_window_seconds,
+        code_dcb_corrections_m=code_dcb_corrections_m,
     )
+
+
+def _glonass_frequency_channels(ephemerides: pd.DataFrame) -> dict:
+    """Return each healthy GLONASS satellite's L1/L2 frequencies from its nav channel."""
+    if ephemerides.empty or "frequency_number" not in ephemerides:
+        raise ValueError(
+            "GLONASS navigation file has no satellite frequency-channel data"
+        )
+    channels_by_satellite = {}
+    for satellite, records in ephemerides.groupby("sat", sort=False):
+        healthy = records
+        if "sv_health" in healthy:
+            healthy = healthy[healthy["sv_health"].fillna(1) == 0]
+        values = healthy["frequency_number"].dropna().unique()
+        if not len(values):
+            continue
+        channels = {int(value) for value in values if float(value).is_integer()}
+        if len(channels) != 1 or len(channels) != len(values):
+            raise ValueError(
+                "navigation file has inconsistent GLONASS frequency channels "
+                "for {}".format(satellite)
+            )
+        channel = channels.pop()
+        if not -7 <= channel <= 6:
+            raise ValueError(
+                "GLONASS frequency channel for {} is outside -7..6".format(
+                    satellite
+                )
+            )
+        channels_by_satellite[satellite] = (
+            (1602.0 + 0.5625 * channel) * 1e6,
+            (1246.0 + 0.4375 * channel) * 1e6,
+        )
+    return channels_by_satellite
 
 
 def _supported_satellites(ephemerides: pd.DataFrame, systems: str):
@@ -885,6 +1082,24 @@ def _prepare_ephemerides(ephemerides: pd.DataFrame) -> dict:
                 "toe", "toc_gpst")
     prepared = {}
     for satellite, records in ephemerides.groupby("sat", sort=False):
+        if satellite[0] == "R":
+            prepared_records = []
+            required_glonass = (
+                "x", "y", "z", "x_dot", "y_dot", "z_dot",
+                "x_ddot", "y_ddot", "z_ddot", "toc_gpst"
+            )
+            for eph in records.to_dict("records"):
+                if (
+                    pd.isna(eph.get("sv_health", 0))
+                    or float(eph.get("sv_health", 0)) != 0
+                    or any(pd.isna(eph.get(name)) for name in required_glonass)
+                ):
+                    continue
+                prepared_records.append((pd.Timestamp(eph["toc_gpst"]), eph))
+            if prepared_records:
+                prepared[satellite] = prepared_records
+            continue
+
         system_time_offset = 14.0 if satellite[0] == "C" else 0.0
         prepared_records = []
         for eph in records.to_dict("records"):
@@ -964,8 +1179,23 @@ def main(argv=None):
     )
     t.add_argument("obs_file")
     t.add_argument("--ele", type=Path)
+    t.add_argument(
+        "--dcb-p1p2",
+        type=Path,
+        help="CODE P1-P2 satellite DCB file",
+    )
+    t.add_argument(
+        "--dcb-p1c1",
+        type=Path,
+        help="CODE P1-C1 satellite DCB file",
+    )
+    t.add_argument(
+        "--nav",
+        type=Path,
+        help="RINEX navigation file (required for GLONASS channel frequencies)",
+    )
     t.add_argument("--out", type=Path)
-    t.add_argument("--system", choices=("G", "E", "C"), default="G")
+    t.add_argument("--system", choices=("G", "E", "C", "R"), default="G")
     t.add_argument("--code1")
     t.add_argument("--code2")
     t.add_argument("--phase1")
@@ -992,11 +1222,23 @@ def main(argv=None):
     elif a.cmd == "tec":
         observation_path = Path(a.obs_file)
         try:
+            if a.system == "R" and a.nav is None:
+                raise ValueError(
+                    "GLONASS TEC requires --nav to read satellite frequency channels"
+                )
+            if a.system == "R" and (
+                a.frequency1 is not None or a.frequency2 is not None
+            ):
+                raise ValueError(
+                    "GLONASS frequencies are derived from --nav; do not set "
+                    "--frequency1 or --frequency2"
+                )
             header, _ = read_obs(observation_path, systems=a.system)
             signal_defaults = {
                 "G": ("C1C", "C2W", "L1C", "L2W", 1575.42e6, 1227.60e6),
                 "E": ("C1C", "C5Q", "L1C", "L5Q", 1575.42e6, 1176.45e6),
                 "C": ("C2I", "C7I", "L2I", "L7I", 1561.098e6, 1207.14e6),
+                "R": ("C1C", "C2C", "L1C", "L2C", 1602.0e6, 1246.0e6),
             }
             defaults = signal_defaults[a.system]
             selected = (
@@ -1031,6 +1273,9 @@ def main(argv=None):
                 frequency_2_hz=selected[5],
                 shell_height_km=a.shell_height,
                 smoothing_window_seconds=a.smoothing_window,
+                navigation_path=a.nav,
+                p1p2_dcb_path=a.dcb_p1p2,
+                p1c1_dcb_path=a.dcb_p1c1,
             )
             if tec.empty:
                 raise ValueError(
@@ -1044,9 +1289,7 @@ def main(argv=None):
         print("TEC rows: {}".format(len(tec)))
         print("Output written to: {}".format(output_path))
         print(
-            "Generate plots with: python3 rinex_visualization.py tec {}".format(
-                output_path
-            )
+            "Generate plots with: rinex plot tec {}".format(output_path)
         )
     else:
         nav = read_nav(a.file, a.systems)

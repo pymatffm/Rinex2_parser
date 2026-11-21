@@ -8,19 +8,20 @@ from unittest.mock import patch
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from rinex_2_tool import (
+from rinex_parser.rinex2.tool import (
     calculate_tec_dataframe,
     main,
     open_observation_file,
     read_observation_dataframe,
     write_azimuth_elevation_files,
 )
-from rinex_visualization import (
+from rinex_parser.visualization.plots import (
     plot_pierce_point_map,
     plot_vtec_by_satellite,
 )
-from tec_calculation import (
+from rinex_parser.tec_calculation import (
     calculate_tec_dataframe as calculate_normalized_tec_dataframe,
     normalize_long_observations,
     observation_time_to_utc,
@@ -306,7 +307,7 @@ class RinexObservationParserTests(unittest.TestCase):
     def test_cli_writes_csv_into_output_directory_by_default(self):
         output_dir = Path(tempfile.mkdtemp())
         try:
-            with patch("rinex_2_tool.DATA_2_OUTPUT_DIR", output_dir):
+            with patch("rinex_parser.rinex2.tool.DATA_2_OUTPUT_DIR", output_dir):
                 result = main([str(self.file_path)])
 
             output_file = output_dir / (self.file_path.name + ".csv")
@@ -351,7 +352,7 @@ class RinexObservationParserTests(unittest.TestCase):
         navigation_file = make_rinex_file(contents)
         output_dir = Path(tempfile.mkdtemp())
         try:
-            with patch("rinex_2_tool.DATA_2_OUTPUT_DIR", output_dir):
+            with patch("rinex_parser.rinex2.tool.DATA_2_OUTPUT_DIR", output_dir):
                 result = main(["nav", str(navigation_file)])
 
             output_file = output_dir / (navigation_file.name + ".csv")

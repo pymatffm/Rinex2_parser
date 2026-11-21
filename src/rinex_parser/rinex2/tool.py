@@ -18,6 +18,7 @@ from ..tec_calculation import (
     calculate_tec_dataframe as calculate_normalized_tec_dataframe,
     elevations_from_compact_file,
 )
+from ..dcb import geometry_free_code_correction, read_dcb_file
 
 
 NAVIGATION_FIELDS = (
@@ -617,6 +618,8 @@ def calculate_tec_dataframe(
     observation_path: Path,
     elevation_path: Path,
     shell_height_km: float = 350.0,
+    p1p2_dcb_path: Optional[Path] = None,
+    p1c1_dcb_path: Optional[Path] = None,
 ) -> pd.DataFrame:
     """Adapt RINEX 2 observations to the reusable TEC calculation API."""
     _, elevations_by_epoch = elevations_from_compact_file(elevation_path)
@@ -646,6 +649,13 @@ def calculate_tec_dataframe(
             )
         l1_index = header.observation_types.index("L1")
         l2_index = header.observation_types.index("L2")
+        p1p2_dcb_m = (
+            read_dcb_file(p1p2_dcb_path) if p1p2_dcb_path is not None else {}
+        )
+        p1c1_dcb_m = (
+            read_dcb_file(p1c1_dcb_path) if p1c1_dcb_path is not None else {}
+        )
+        code_dcb_corrections_m = {}
         for epoch in epochs:
             for satellite, observations in epoch.observations.items():
                 if not satellite.startswith("G"):
@@ -666,6 +676,13 @@ def calculate_tec_dataframe(
                         break
                 l1_observation = observations[l1_index]
                 l2_observation = observations[l2_index]
+                code_dcb_corrections_m[satellite] = geometry_free_code_correction(
+                    satellite,
+                    selected_pair[0],
+                    selected_pair[1],
+                    p1p2_dcb_m,
+                    p1c1_dcb_m,
+                )
                 observation_records.append({
                     "epoch": epoch.timestamp,
                     "satellite": satellite,
@@ -687,6 +704,7 @@ def calculate_tec_dataframe(
         pd.DataFrame.from_records(elevation_records, columns=ELEVATION_COLUMNS),
         shell_height_km=shell_height_km,
         time_system=header.time_system,
+        code_dcb_corrections_m=code_dcb_corrections_m,
     )
 
 
@@ -923,6 +941,8 @@ def main_tec(argv=None) -> int:
         type=Path,
         help="output CSV path (default: Data_2/output/<obs-stem>_tec.csv)",
     )
+    argument_parser.add_argument("--dcb-p1p2", type=Path, help="CODE P1-P2 DCB file")
+    argument_parser.add_argument("--dcb-p1c1", type=Path, help="CODE P1-C1 DCB file")
     args = argument_parser.parse_args(argv)
     elevation_path = args.ele or DATA_2_OUTPUT_DIR / (
         args.observation_file.stem + ".ele"
@@ -935,6 +955,8 @@ def main_tec(argv=None) -> int:
             args.observation_file,
             elevation_path,
             args.shell_height,
+            args.dcb_p1p2,
+            args.dcb_p1c1,
         )
         if dataframe.empty:
             raise ValueError(
@@ -947,18 +969,16 @@ def main_tec(argv=None) -> int:
         print("Shell height: {:.1f} km".format(args.shell_height))
         print("Output written to: {}".format(output_path))
         print(
-            "Generate plots with: python3 rinex_visualization.py tec {}".format(
-                output_path
-            )
+            "Generate plots with: rinex plot tec {}".format(output_path)
         )
         print(
-            "Uncalibrated STEC range: {:.2f} to {:.2f} TECU".format(
+            "STEC range: {:.2f} to {:.2f} TECU".format(
                 dataframe["stec_tecu_uncalibrated"].min(),
                 dataframe["stec_tecu_uncalibrated"].max(),
             )
         )
         print(
-            "Uncalibrated VTEC range: {:.2f} to {:.2f} TECU".format(
+            "VTEC range: {:.2f} to {:.2f} TECU".format(
                 dataframe["phase_smoothed_vtec_tecu_uncalibrated"].min(),
                 dataframe["phase_smoothed_vtec_tecu_uncalibrated"].max(),
             )

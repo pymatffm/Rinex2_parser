@@ -7,8 +7,8 @@ azimuth files, similar to those produced by the legacy teqc utility. A separate
 visualization command generates satellite plots and pierce-point maps from the
 parser outputs.
 
-RINEX 3 and RINEX 4 also support generating elevation and azimuth files. Differential
-code bias (DCB) corrections from external files are not currently applied (WIP).
+RINEX 3 and RINEX 4 also support generating elevation and azimuth files.
+CODE P1-P2 and P1-C1 monthly DCB files can be applied to TEC calculations.
 
 NB: The original code was written in 2015 with Python 2.7 and has since been updated to Python 3.9+ with a
 focus on RINEX 3 / RINEX 4 support. The RINEX 2 parser is included for legacy support. The revamped new code has
@@ -34,31 +34,27 @@ uv run rinex map --latitude 36.2 --longitude 34.3 --output output/station_map.pn
 
 The command groups `rinex2`, `rinex34`, `plot`, and `map` expose the existing
 parser and visualization options. `python -m rinex_parser` is also supported.
-The former top-level script names remain as compatibility wrappers, so
-existing commands such as `python3 rinex_2_tool.py ...` continue to work.
-
-
 # RINEX 2 Parser
 
-The current `rinex_2_tool.py` parses RINEX 2 observation files, prints a summary,
+The `rinex rinex2` command parses RINEX 2 observation files, prints a summary,
 and writes the observations CSV to `Data_2/output/`.
 
 Run it on the included default sample:
 
 ```sh
-python3 rinex_2_tool.py
+uv run rinex rinex2
 ```
 
 Specify a RINEX 2 observation file (place RINEX 2 files in the `Data/` directory):
 
 ```sh
-python3 rinex_2_tool.py Data/kepa3150.13o
+uv run rinex rinex2 Data/kepa3150.13o
 ```
 
 Recommended with `uv`, because you don’t need to activate the environment to run a command—use uv run, for example:
 
 ```shell
-uv run python3 rinex_2_tool.py Data/kepa3150.13o
+uv run rinex rinex2 Data/kepa3150.13o
 ```
 
 The parser API also returns a pandas DataFrame with one row per epoch/satellite.
@@ -70,15 +66,15 @@ with `.csv` appended. `--csv` changes the output filename while keeping it in
 that folder:
 
 ```sh
-uv run python3 rinex_2_tool.py Data_2/kepa3150.13o
-uv run python3 rinex_2_tool.py Data_2/kepa3150.13o --csv Data_2/output/observations.csv
+uv run rinex rinex2 Data_2/kepa3150.13o
+uv run rinex rinex2 Data_2/kepa3150.13o --csv Data_2/output/observations.csv
 ```
 
 RINEX 2 navigation files can also be parsed; their CSV is written to the same
 folder by default:
 
 ```sh
-uv run python3 rinex_2_tool.py nav Data_2/brdc3170.13n
+uv run rinex rinex2 nav Data_2/brdc3170.13n
 ```
 
 ## Azimuth and Elevation
@@ -87,7 +83,7 @@ pair (15-second sampling by default). These files are written to
 `Data_2/output/` and use the compact format consumed by the legacy VTEC code:
 
 ```sh
-uv run python3 rinex_2_tool.py angles Data_2/kepa3170.13o Data_2/brdc3170.13n
+uv run rinex rinex2 angles Data_2/kepa3170.13o Data_2/brdc3170.13n
 ```
 
 Use `--interval SECONDS` to change the sampling interval or `--outdir DIR` to
@@ -99,7 +95,7 @@ Calculate slant and vertical TEC from dual-frequency code and carrier-phase
 observations plus the matching compact elevation file:
 
 ```sh
-uv run python3 rinex_2_tool.py tec Data_2/kepa3170.13o
+uv run rinex rinex2 tec Data_2/kepa3170.13o
 ```
 
 The CSV is written to `Data_2/output/kepa3170_tec.csv`. Code pseudoranges
@@ -109,11 +105,12 @@ in the L1/L2 carrier-phase geometry-free measurement smooth it with a
 estimate, which is precise in relative changes but has an unresolved ambiguity
 offset. A 350 km thin-shell mapping height is used by default
 (`--shell-height KM` changes it). Since no DCB correction is applied, the
-STEC/VTEC estimates are uncalibrated. Plotting is a separate step, so the TEC
+STEC/VTEC estimates are uncalibrated unless matching CODE DCB files are supplied.
+Plotting is a separate step, so the TEC
 CSV can be processed independently of the parser:
 
 ```sh
-uv run python3 rinex_visualization.py tec Data_2/output/kepa3170_tec.csv
+uv run rinex plot tec Data_2/output/kepa3170_tec.csv
 ```
 
 This writes per-satellite plots of phase-smoothed VTEC against a third-degree
@@ -123,7 +120,7 @@ elevation file and `--out FILE` selects the CSV destination. GPS-time epochs are
 converted to UTC in the CSV and plot axis using the applicable leap-second
 offset.
 
-The reusable calculation API is in `tec_calculation.py`. It accepts normalized
+The reusable calculation API is in `rinex_parser.tec_calculation`. It accepts normalized
 observation rows (`epoch`, `satellite`, two code measurements, two phase
 measurements, their frequencies, LLI flags, and `code_pair`) plus elevation
 rows (`epoch`, `satellite`, `elevation_deg`). 
@@ -136,17 +133,17 @@ Generate a pierce-point map from compact azimuth/elevation results using the
 receiver's geodetic coordinates:
 
 ```sh
-uv run python3 rinex_visualization.py map \
+uv run rinex plot map \
   --azimuth Data_2/output/kepa3170.azi \
   --elevation Data_2/output/kepa3170.ele \
   --latitude LATITUDE --longitude LONGITUDE
 ```
 
 For a station-centered map independent of the RINEX parsers and satellite
-inputs, use `map_generation.py` directly:
+inputs, use `rinex map`:
 
 ```sh
-uv run python3 map_generation.py \
+uv run rinex map \
   --latitude 36.2 --longitude 34.3 --output output/station_map.png
 ```
 
@@ -154,7 +151,7 @@ An optional CSV with `elevation_deg` and `azimuth_deg` columns adds thin-shell
 ionospheric pierce points:
 
 ```sh
-uv run python3 map_generation.py \
+uv run rinex map \
   --latitude 36.2 --longitude 34.3 \
   --angles satellite_angles.csv \
   --shell-height 350 \
@@ -166,9 +163,9 @@ are also available as independent functions and CLI modes. Global and globe
 views need only station coordinates:
 
 ```sh
-uv run python3 map_generation.py --mode global \
+uv run rinex map --mode global \
   --latitude LAT --longitude LON --output output/global.png
-uv run python3 map_generation.py --mode funky-earth \
+uv run rinex map --mode funky-earth \
   --latitude LAT --longitude LON --output output/globe.png
 ```
 
@@ -176,7 +173,7 @@ For `--mode tracks`, pass a CSV with `satellite`, `latitude_deg`, and
 `longitude_deg` columns:
 
 ```sh
-uv run python3 map_generation.py --mode tracks \
+uv run rinex map --mode tracks \
   --latitude LAT --longitude LON --tracks pierce_points.csv \
   --output output/tracks.png
 ```
@@ -194,17 +191,16 @@ uv run python3 -m unittest discover -s tests -v
 Pure-Python parser for RINEX 3.x and RINEX 4.00 observation and navigation files
 (GPS, Galileo, BeiDou first-class; GLONASS/QZSS/NavIC/SBAS parsed generically),
 with timescale conversion (GPST/UTC/TAI/BDT/GST), tidy pandas
-extraction and summary statistics. Plotting is provided separately by
-`rinex_visualization.py`.
+extraction and summary statistics. Plotting is provided by `rinex plot`.
 
 Requires: Python >= 3.9, numpy, pandas, matplotlib (pytest for the tests). These are however optional dependencies; the parser itself has no external dependencies.
 
 ## CLI
 
-    python rinex_3_4_tool.py obs <file.o> [-o outdir] [--systems GEC]
-    python rinex_3_4_tool.py nav <file.n> [-o outdir] [--systems GEC]
-    python rinex_3_4_tool.py angles <file.o> <file.n> [-o outdir] [--interval 15] [--systems GEC]
-    python rinex_3_4_tool.py tec <file.o> [--ele file.ele] [-o outdir]
+    rinex rinex34 obs <file.o> [-o outdir] [--systems GEC]
+    rinex rinex34 nav <file.n> [-o outdir] [--systems GEC]
+    rinex rinex34 angles <file.o> <file.n> [-o outdir] [--interval 15] [--systems GEC]
+    rinex rinex34 tec <file.o> [--ele file.ele] [-o outdir]
 
 `--systems` accepts one or more RINEX system letters (default: `GEC`):
 
@@ -234,7 +230,7 @@ and `summary_DDMMYY.json`. All output filenames include the same run date.
 Generate its SNR and satellite visibility plots separately from the long CSV:
 
 ```sh
-uv run python3 rinex_visualization.py observations \
+uv run rinex plot observations \
   Data_3_4/output/v400/observations_long_DDMMYY.csv
 ```
 Plot titles include the station marker from the matching summary JSON and the
@@ -251,10 +247,11 @@ system-time offset and ionosphere records.
 
 `angles` uses the observation receiver coordinates and broadcast ephemerides
 to write compact `.azi` and `.ele` files under the selected output root's
-version directory (GPS, Galileo, and BeiDou broadcast orbits are supported):
+version directory (GPS, Galileo, BeiDou, and GLONASS broadcast orbits are
+supported):
 
 ```sh
-uv run python3 rinex_3_4_tool.py angles \
+uv run rinex rinex34 angles \
   Data_3_4/input/station.24o Data_3_4/input/brdc.24n
 ```
 
@@ -269,10 +266,10 @@ Calculate uncalibrated STEC/VTEC from the RINEX 3/ RINEX 4 observations and gene
 elevations, then plot the resulting CSV separately:
 
 ```sh
- uv run python3 rinex_3_4_tool.py angles Data_3_4/input/MERS00TUR_R_20230370000_01D_30S_MO.rnx \ 
+ uv run rinex rinex34 angles Data_3_4/input/MERS00TUR_R_20230370000_01D_30S_MO.rnx \
   Data_3_4/input/MERS00TUR_R_20230370000_01D_EN.rnx --systems E
-uv run python rinex_3_4_tool.py tec Data_3_4/input/MERS00TUR_R_20230370000_01D_30S_MO.rnx --system E
-uv run python3 rinex_visualization.py tec Data_3_4/output/v303/MERS00TUR_R_20230370000_01D_30S_MO_tec.csv 
+uv run rinex rinex34 tec Data_3_4/input/MERS00TUR_R_20230370000_01D_30S_MO.rnx --system E
+uv run rinex plot tec Data_3_4/output/v303/MERS00TUR_R_20230370000_01D_30S_MO_tec.csv
 ```
 
 NB: The `systems` option is used to specify which satellite systems to process, and is corresponding to the letter preceding the 'N' in the navigation file name. 
@@ -283,12 +280,29 @@ versioned output directory and writes `<observation-stem>_tec.csv` there.
 `--ele FILE` selects another elevation file. `--out DIR` selects an output
 root, while `--out FILE.csv` writes to an explicit CSV path. GPS is selected by
 default with `C1C/C2W` code and `L1C/L2W` phase signals at L1/L2 frequencies.
-`--system E` and `--system C` select Galileo and BeiDou presets respectively;
-use `--code1`, `--code2`, `--phase1`, `--phase2`, `--frequency1`, and
-`--frequency2` to match the signals and frequencies actually present in your
-file. The selected signal types must exist in the observation header. TEC
+`--system E` and `--system C` select Galileo and BeiDou presets respectively.
+For GLONASS, use `--system R --nav NAV_FILE`; the default signals are
+`C1C/C2C` and `L1C/L2C`, and satellite-specific L1/L2 frequencies are derived
+from each satellite's channel in the navigation file. For other systems,
+`--code1`, `--code2`, `--phase1`, `--phase2`, `--frequency1`, and `--frequency2`
+can select the signals and frequencies present in your file. The selected
+signal types must exist in the observation header. TEC
 epochs are converted to UTC in the CSV; the calculation is uncalibrated unless
-valid DCB corrections are applied separately. `.azi` is not needed for VTEC.
+valid DCB corrections are applied. `.azi` is not needed for VTEC.
+
+For C1/C2 TEC calculations, provide the applicable monthly CODE files:
+
+```sh
+uv run rinex rinex34 tec OBS_FILE \
+  --system G \
+  --dcb-p1p2 Data_2/P1P21103_ALL.DCB \
+  --dcb-p1c1 Data_2/P1C11103.DCB
+```
+
+`--dcb-p1p2` is used to correct the P1-P2 geometry-free code combination;
+`--dcb-p1c1` converts C1 observables to P1 before applying that combination.
+Unknown satellites are left uncorrected, and DCBs are not interpolated across
+months; use files whose solution month covers the observation date.
 
 With `uv`, you don’t need to activate the environment to run a command—use `uv run`, for example:
 

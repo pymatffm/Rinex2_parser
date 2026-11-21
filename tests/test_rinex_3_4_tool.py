@@ -2,22 +2,44 @@ import sys, pathlib
 from datetime import date
 from unittest.mock import patch
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1]))
+sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "src"))
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import numpy as np, pandas as pd, pytest
-import rinex_3_4_tool as rt, make_sample as ms
-import rinex_visualization as viz
-from rinex_visualization import plot_observation_diagnostics
+import rinex_parser.rinex34.tool as rt
+import make_sample as ms
+import rinex_parser.visualization.plots as viz
+from rinex_parser.visualization.plots import plot_observation_diagnostics
+from rinex_parser.dcb import (
+    geometry_free_code_correction,
+    read_dcb_file,
+)
+
+
+def test_code_dcb_files_are_parsed_as_satellite_biases(tmp_path):
+    dcb_path = tmp_path / "P1P2.DCB"
+    dcb_path.write_text(
+        "CODE'S MONTHLY GNSS P1-P2 DCB SOLUTION\n"
+        "PRN / STATION NAME        VALUE (NS)  RMS (NS)\n"
+        "G01                           2.155       0.026\n"
+        "G     ABMF 97103M001        -11.046       0.074\n"
+    )
+    biases = read_dcb_file(dcb_path)
+    assert biases["G01"] == pytest.approx(2.155e-9 * 299792458.0)
+    assert "ABMF" not in biases
+    assert geometry_free_code_correction(
+        "G01", "C1C", "C2W", {"G01": 0.646}, {"G01": 0.320}
+    ) == pytest.approx(0.326)
 
 
 def test_plot_context_uses_station_and_recording_dates():
     observations = pd.DataFrame(
         {
-            "time": pd.to_datetime(["2024-03-15 00:00", "2024-03-15 00:02"]),
-            "time_utc": pd.to_datetime(["2024-03-14 23:59", "2024-03-15 00:01"]),
+            "time": pd.to_datetime(["2023-02-06 00:00", "2023-02-06 00:02"]),
+            "time_utc": pd.to_datetime(["2023-02-05 23:59:42", "2023-02-06 00:01:42"]),
         }
     )
     assert viz._observation_plot_context(observations, "", "MERS00TUR") == (
-        "MERS00TUR - 2024-03-14 to 2024-03-15"
+        "MERS00TUR - 2023-02-06"
     )
     assert viz._station_from_filename(
         pathlib.Path("MERS00TUR_R_20240740000_01D_30S_MO.rnx")
@@ -100,6 +122,110 @@ def test_nav_header_time_correction_with_adjacent_exponents(tmp_path):
     assert correction["w"] == 2248
 
 
+def test_glonass_navigation_supports_angle_generation(tmp_path):
+    nav_path = tmp_path / "glonass.rnx"
+    nav_lines = [
+        ms.hdr(
+            "     3.04           NAVIGATION DATA     M",
+            "RINEX VERSION / TYPE",
+        ),
+        ms.hdr("", "END OF HEADER"),
+        "R01 2024 03 14 00 00 00" + ms._e(0) + ms._e(0) + ms._e(0),
+    ]
+    state_rows = (
+        (4 * ms.XYZ[0] / 1000, 0, 0, 0),
+        (4 * ms.XYZ[1] / 1000, 3, 0, -4),
+        (4 * ms.XYZ[2] / 1000, 0, 0, 0),
+    )
+    nav_lines.extend(
+        "    " + "".join(ms._e(value) for value in row) for row in state_rows
+    )
+    nav_path.write_text("\n".join(nav_lines) + "\n")
+    nav = rt.read_nav(nav_path, systems="R")
+    ephemerides = nav.ephemeris
+    assert ephemerides.loc[0, "sv_health"] == 0
+    assert rt._supported_satellites(ephemerides, "R") == {"R01"}
+    assert rt._glonass_frequency_channels(ephemerides)["R01"] == pytest.approx(
+        (1599.75e6, 1244.25e6)
+    )
+    assert np.isfinite(
+        rt._satellite_position_gnss(
+            ephemerides.loc[0, "toc_gpst"],
+            "R01",
+            ephemerides,
+            None,
+            rt._prepare_ephemerides(ephemerides)["R01"],
+        )
+    ).all()
+
+    observation_path = tmp_path / "glonass.obs"
+    observation_path.touch()
+    epoch = pd.Timestamp("2024-03-14 00:00:00")
+    observations = pd.DataFrame(
+        {
+            "time": [epoch],
+            "sat": ["R01"],
+            "type": ["C"],
+            "value": [23_000_000.0],
+        }
+    )
+    header = rt.ObsHeader(version=3.04, approx_xyz=ms.XYZ, time_system="GPS")
+    with patch.object(rt, "read_obs", return_value=(header, observations)):
+        azimuth_path, elevation_path = rt.write_azimuth_elevation_files(
+            observation_path,
+            nav_path,
+            output_dir=tmp_path / "output",
+            systems="R",
+        )
+    assert azimuth_path.is_file()
+    assert elevation_path.is_file()
+    assert "R01" in elevation_path.read_text()
+
+    tec_observations = pd.DataFrame(
+        [
+            {
+                "time": epoch,
+                "sat": "R01",
+                "code": code,
+                "value": value,
+                "lli": 0,
+            }
+            for code, value in (
+                ("C1C", 23_000_000.0),
+                ("C2C", 23_000_010.0),
+                ("L1C", 120_000_000.0),
+                ("L2C", 95_000_000.0),
+            )
+        ]
+    )
+    header.obs_types = {"R": ["C1C", "C2C", "L1C", "L2C"]}
+    with (
+        patch.object(rt, "read_obs", return_value=(header, tec_observations)),
+        patch.object(
+            rt,
+            "elevations_from_compact_file",
+            return_value=(30.0, {epoch: {"R01": 45.0}}),
+        ),
+        patch.object(
+            rt,
+            "calculate_normalized_tec_dataframe",
+            side_effect=lambda normalized, *args, **kwargs: normalized,
+        ),
+    ):
+        normalized = rt.calculate_tec_from_observation_file(
+            observation_path,
+            elevation_path,
+            system="R",
+            code_1="C1C",
+            code_2="C2C",
+            phase_1="L1C",
+            phase_2="L2C",
+            navigation_path=nav_path,
+        )
+    assert normalized.loc[0, "frequency_1_hz"] == pytest.approx(1599.75e6)
+    assert normalized.loc[0, "frequency_2_hz"] == pytest.approx(1244.25e6)
+
+
 def test_rinex2_rejected(tmp_path):
     p = tmp_path / "o.rnx"
     p.write_text("     2.11           OBSERVATION DATA    G (GPS)             RINEX VERSION / TYPE\n")
@@ -144,7 +270,7 @@ def test_generate_compact_azimuth_elevation(tmp_path, ver):
     receiver = np.asarray(ms.XYZ)
     above_receiver = tuple(receiver * (1 + 20_000_000 / np.linalg.norm(receiver)))
     with patch(
-        "rinex_3_4_tool._satellite_position_gnss",
+        "rinex_parser.rinex34.tool._satellite_position_gnss",
         return_value=above_receiver,
     ):
         azimuth_path, elevation_path = rt.write_azimuth_elevation_files(
@@ -173,7 +299,7 @@ def test_angles_only_processes_requested_observed_constellation(tmp_path):
     above_receiver = tuple(receiver * (1 + 20_000_000 / np.linalg.norm(receiver)))
 
     with patch(
-        "rinex_3_4_tool._satellite_position_gnss",
+        "rinex_parser.rinex34.tool._satellite_position_gnss",
         return_value=above_receiver,
     ) as position:
         rt.write_azimuth_elevation_files(
@@ -248,7 +374,7 @@ def test_tec_cli_calculates_from_compact_elevation(tmp_path, ver):
     above_receiver = tuple(receiver * (1 + 20_000_000 / np.linalg.norm(receiver)))
 
     with patch(
-        "rinex_3_4_tool._satellite_position_gnss",
+        "rinex_parser.rinex34.tool._satellite_position_gnss",
         return_value=above_receiver,
     ):
         assert rt.main([

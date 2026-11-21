@@ -195,6 +195,7 @@ def calculate_tec_dataframe(
     shell_height_km: float = 350.0,
     time_system: str = "GPS",
     smoothing_window_seconds: float = 100.0,
+    code_dcb_corrections_m: Dict[str, float] = None,
 ) -> pd.DataFrame:
     """Calculate uncalibrated STEC/VTEC from normalized observation tables.
 
@@ -223,6 +224,7 @@ def calculate_tec_dataframe(
         )
 
     observations = observations.copy()
+    code_dcb_corrections_m = code_dcb_corrections_m or {}
     elevations = elevations.loc[:, ELEVATION_COLUMNS].copy()
     observations["epoch"] = pd.to_datetime(observations["epoch"])
     elevations["epoch"] = pd.to_datetime(elevations["epoch"])
@@ -271,7 +273,10 @@ def calculate_tec_dataframe(
                 continue
 
             code_stec = stec_from_pseudoranges(
-                code_1, code_2, frequency_1, frequency_2
+                code_1,
+                code_2 + code_dcb_corrections_m.get(satellite, 0.0),
+                frequency_1,
+                frequency_2,
             )
             phase_stec = stec_from_carrier_phase(
                 phase_1, phase_2, frequency_1, frequency_2
